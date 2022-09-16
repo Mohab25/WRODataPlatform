@@ -31,9 +31,9 @@ class Default:
     REGION = 'us'
 
     # BigQuery
-    BIGQUERY_DATASET_DAILY = 'weather_daily'
-    BIGQUERY_DATASET_MONTHLY = 'weather_monthly'
-    BIGQUERY_DATASET_CLIMATOLOGY = 'weather_climatology'
+    BIGQUERY_DATASET_DAILY = 'NASA_POWER_climate'
+    BIGQUERY_DATASET_MONTHLY = 'NASA_POWER_weather_daily'
+    BIGQUERY_DATASET_CLIMATOLOGY = 'NASA_POWER_weather_monthly'
     LIST_BQ_DATASETS = [
         BIGQUERY_DATASET_DAILY,
         BIGQUERY_DATASET_MONTHLY,
@@ -1315,7 +1315,7 @@ def download_weather_data_into_bigquery(event, context):
                         community,
                         period,
                         '2006',
-                        '2022'
+                        'present'
                         # start_y,
                         # end_y
                     )

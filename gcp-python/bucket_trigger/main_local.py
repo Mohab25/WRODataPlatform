@@ -1,4 +1,6 @@
 import sys
+
+import pandas.api.types
 from google.cloud import storage
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
@@ -12,6 +14,7 @@ import os
 import time
 from datetime import datetime
 import gcsfs
+import numpy
 from dateutil.parser import parse
 import math
 
@@ -24,25 +27,26 @@ class Default:
     # For testing
     #BUCKET_TEMP = 'wrc_wro_temp2'
     #PROJECT_ID = 'static-webbing-359410'
-    #BUCKET_TRIGGER = 'wrc_wro_temp2'
+    #BUCKET_TRIGGER = 'trigger_bucket2'
+    #BIGQUERY_DATASET_BUCKET = 'bucket_data'
+    #REGION = 'us-east1'
 
     # Projects
     PROJECT_ID = 'wrc-wro'
 
     # Buckets
-    #BUCKET_TRIGGER = 'wro-trigger-test'
+    BUCKET_TRIGGER = 'wrc_wro_datasets'
     BUCKET_DONE = 'wro-done'
     BUCKET_FAILED = 'wro-failed'
     BUCKET_TEMP = 'wrc_wro_temporary'
-    BUCKET_TRIGGER = 'wrc_wro_temporary'
 
     # Regions (e.g. us, us-east1, etc.)
-    REGION = 'us-east1'
+    REGION = 'us'
 
     # BigQuery
-    BIGQUERY_DATASET_DAILY = 'weather_daily'
-    BIGQUERY_DATASET_MONTHLY = 'weather_monthly'
-    BIGQUERY_DATASET_CLIMATOLOGY = 'weather_climatology'
+    BIGQUERY_DATASET_DAILY = 'NASA_POWER_climate'
+    BIGQUERY_DATASET_MONTHLY = 'NASA_POWER_weather_daily'
+    BIGQUERY_DATASET_CLIMATOLOGY = 'NASA_POWER_weather_monthly'
     BIGQUERY_DATASET_BUCKET = 'bucket_tables'
     LIST_BQ_DATASETS = [
         BIGQUERY_DATASET_DAILY,
@@ -82,6 +86,8 @@ class Default:
     NASA_POWER_TEMPORAL_AVE = [DAILY, MONTHLY, CLIMATOLOGY]
     NUMBER_OF_PREVIOUS_DAY = 5  # This will be the number of days prior to the current/today date
     SKIP_CLIMATOLOGY = True  # These datasets will likely not change
+    SLEEP_LENGTH = 20  # How long python will do a sleep (e.g. waiting for data). Seconds
+    SLEEP_COUNT = 5  # Number of sleeps which will be performed, likely before timeout is performed
 
     # 'D' for daily downloads, 'M' for all days on a monthly basis
     # 'M' will be useful for bulk downloads, but set to 'D' for the Cloud trigger as it should only
@@ -915,18 +921,28 @@ class Utilities:
         """
         list_newline_json = []
 
+        now = datetime.now()
+        print('[' + str(now) + '] ' + "Converting to newline JSON")
+
         list_features = data_json['features']
         for feature in list_features:
-            feat_properties = feature['properties']
-            feat_id = feat_properties['id']
-            feat_desc = feat_properties['desc']
+            feat_id = feature['id']
             feat_geom = feature['geometry']
 
+            coordinates = feat_geom['coordinates']
+            feat_geom['coordinates'] = str(coordinates)
+
             new_json_feat = {
-                'id': feat_id,
-                'desc': feat_desc,
+                'id': int(feat_id),
                 'geometry': feat_geom
             }
+
+            # A list of the all other attribute fields
+            feat_properties = feature['properties']
+            for feat_property in feat_properties:
+                if feat_property not in new_json_feat:
+                    new_json_feat[feat_property] = feat_properties[feat_property]
+
             list_newline_json.append(new_json_feat)
 
         return list_newline_json
@@ -938,43 +954,56 @@ class Utilities:
         :param shp_file: Google cloud storage directory of the shapefile (e.g. gs://bucket/folder/file.shp)
         :type shp_file: Shapefile
         """
-
-        print('shp found')
-
         gc_shp = 'gs://' + Default.BUCKET_TRIGGER + '/' + shp_file
 
+        now = datetime.now()
+        print('[' + str(now) + '] ' + "Reading the shapefile using geopandas")
         shp_geopandas = geopandas.read_file(gc_shp)
+        list_data_types = shp_geopandas.dtypes
+
         shp_json = json.loads(shp_geopandas.to_json())
         newline_json = Utilities.convert_json_to_newline_json(shp_json)
 
-        print('newline json created')
+        schema = [
+            bigquery.SchemaField('id', 'INTEGER', mode='NULLABLE'),
+            bigquery.SchemaField('geometry', 'GEOGRAPHY', mode='NULLABLE')
+        ]
+
+        first_feat = newline_json[0]
+        for field_name in first_feat:
+            if field_name == 'id' or field_name == 'geometry':
+                # Skips these fields as its already added
+                continue
+
+            field_type = list_data_types[field_name]
+            if pandas.api.types.is_integer_dtype(field_type):
+                f_type = 'INTEGER'
+            elif pandas.api.types.is_float_dtype(field_type):
+                f_type = 'FLOAT'
+            else:
+                f_type = 'STRING'
+
+            schema.append(bigquery.SchemaField(
+                field_name,
+                f_type,
+                mode='NULLABLE'
+            ))
 
         client_bq = bigquery.Client()
 
-        bq_table_uri = Default.PROJECT_ID + '.' + Default.BIGQUERY_DATASET_BUCKET + '.' + shp_file.replace('.shp', '')
-
-        schema = [
-            bigquery.SchemaField('id', 'INTEGER', mode='NULLABLE'),
-            bigquery.SchemaField('desc', 'STRING', mode='NULLABLE'),
-            bigquery.SchemaField('geometry', 'GEOGRAPHY', mode='NULLABLE'),
-        ]
+        table_name = os.path.basename(shp_file).replace('.shp', '')
+        bq_table_uri = Default.PROJECT_ID + '.' + Default.BIGQUERY_DATASET_BUCKET + '.' + table_name
 
         table = bigquery.Table(bq_table_uri, schema=schema)
         client_bq.create_table(table)
-
-        print('table created')
 
         job_config = bigquery.LoadJobConfig(
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
             source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         )
 
-        print('start load')
-
         load_job = client_bq.load_table_from_json(newline_json, bq_table_uri, job_config=job_config)
         load_job.result()
-
-        print('done')
 
     @staticmethod
     def write_to_file(file, lines):
@@ -1051,7 +1080,13 @@ class Utilities:
                     for contentfilename in myzip.namelist():
                         contentfile = myzip.read(contentfilename)
 
-                        blob_upload = bucket.blob(contentfilename)
+                        file_gs_path = os.path.dirname(zip_file)
+
+                        # The extracted files goes to the same folder as the zip file
+                        if file_gs_path == '':
+                            blob_upload = bucket.blob(contentfilename)
+                        else:
+                            blob_upload = bucket.blob(file_gs_path + '/' + contentfilename)
                         blob_upload.upload_from_string(contentfile)
         except Exception as e:
             # Loading from csv file into bigquery failed
@@ -1733,8 +1768,8 @@ class Utilities:
 
         # URIs/Paths
         csv_name = os.path.basename(upload_uri)
-        temp_name = 'zzzzztemp_' + csv_name.replace('.csv', '_' + str(chunk_num) + '.csv')
-        temp_uri = 'gs://' + Default.BUCKET_TRIGGER + '/' + temp_name
+        temp_name = 'temp_' + csv_name.replace('.csv', '_' + str(chunk_num) + '.csv')
+        temp_uri = 'gs://' + Default.BUCKET_TEMP + '/' + temp_name
 
         now = datetime.now()
         print('[' + str(now) + '] ' + 'Opening file')
@@ -1841,7 +1876,7 @@ class Utilities:
                 # More rows to process
                 skip_rows = skip_rows + Default.CSV_ROW_READ_LIMIT
                 chunk_num = chunk_num + 1
-                temp_name = 'zzzzztemp_' + csv_name.replace('.csv', '_' + str(chunk_num) + '.csv')
+                temp_name = 'temp_' + csv_name.replace('.csv', '_' + str(chunk_num) + '.csv')
                 temp_uri = 'gs://' + Default.BUCKET_TRIGGER + '/' + temp_name
 
                 now = datetime.now()
@@ -1894,6 +1929,7 @@ def data_added_to_bucket():
     client = storage.Client(project=Default.PROJECT_ID)
     bucket = client.get_bucket(Default.BUCKET_TRIGGER)
     bucket_temp = client.get_bucket(Default.BUCKET_TEMP)
+    client_bq = bigquery.Client()
 
     list_csv, list_excel, list_archives, list_raster, list_vector = Utilities.list_bucket_data(
         project=Default.PROJECT_ID,
@@ -1904,13 +1940,22 @@ def data_added_to_bucket():
         now = datetime.now()
         print('[' + str(now) + '] ' + "CSV: " + str(csv_file))
 
-        # REMOVE - JUST FOR TESTING ======================================================================================================
-        if csv_file != "weather_table.csv":
-            continue
-
-        output_table_name = csv_file.replace('.csv', '')
+        output_table_name = os.path.basename(csv_file).replace('.csv', '')
         upload_uri = 'gs://' + Default.BUCKET_TRIGGER + '/' + csv_file
         bq_table_uri = Default.PROJECT_ID + '.' + Default.BIGQUERY_DATASET_BUCKET + '.' + output_table_name
+
+        # Quick test to see of the BigQuery table exists
+        try:
+            table_bq = client_bq.get_table(bq_table_uri)
+            table_exist = True
+        except NotFound:
+            table_exist = False
+
+        if table_exist:
+            # Skip file if the table exists
+            now = datetime.now()
+            print('[' + str(now) + '] ' + "Table exists")
+            continue
 
         now = datetime.now()
         print('[' + str(now) + '] ' + "PARSING")
@@ -1935,12 +1980,11 @@ def data_added_to_bucket():
 
                 success = Utilities.load_csv_into_bigquery(temp_uri, bq_table_uri, schema, True, 1)
 
+            #bucket_temp.delete_blob(os.path.basename(temp_uri))
             csv_num = csv_num + 1
 
         now = datetime.now()
         print('[' + str(now) + '] ' + "DONE")
-
-        #bucket_temp.delete_blob(os.path.basename(temp_uri))
 
         # if success:
         #     Utilities.move_data(Default.BUCKET_TRIGGER, Default.BUCKET_DONE, csv_file, csv_file)
@@ -1948,14 +1992,99 @@ def data_added_to_bucket():
         #     Utilities.move_data(Default.BUCKET_TRIGGER, Default.BUCKET_FAILED, csv_file, csv_file)
 
     for archive_file in list_archives:
+        now = datetime.now()
+        print('[' + str(now) + '] ' + "Unzipping: " + archive_file)
+
         success = Utilities.unzip(archive_file)
-        if success:
-            bucket.delete_blob(archive_file)
-        else:
-            Utilities.move_data(Default.BUCKET_TRIGGER, Default.BUCKET_FAILED, archive_file, archive_file)
+        # if success:
+        #     bucket.delete_blob(archive_file)
+        # else:
+        #     Utilities.move_data(Default.BUCKET_TRIGGER, Default.BUCKET_FAILED, archive_file, archive_file)
 
     for shp_file in list_vector:
-        Utilities.shp_to_geojson(shp_file)
+        now = datetime.now()
+        print('[' + str(now) + '] ' + "Shapefile: " + shp_file)
+
+        table_name = os.path.basename(shp_file).replace('.shp', '')
+        bq_table_uri = Default.PROJECT_ID + '.' + Default.BIGQUERY_DATASET_BUCKET + '.' + table_name
+        # Quick test to see of the BigQuery table exists
+        try:
+            table_bq = client_bq.get_table(bq_table_uri)
+            table_exist = True
+        except NotFound:
+            table_exist = False
+
+        if table_exist:
+            # Skip file if the table exists
+            now = datetime.now()
+            print('[' + str(now) + '] ' + "Table exists")
+            continue
+
+        # Required files
+        pos_index_file = shp_file.replace('.shp', '.shx')
+        dbf_file = shp_file.replace('.shp', '.dbf')
+        prj_file = shp_file.replace('.shp', '.prj')
+
+        # Other files
+        sbn_file = shp_file.replace('.shp', '.sbn')
+        sbx_file = shp_file.replace('.shp', '.sbx')
+        fbn_file = shp_file.replace('.shp', '.fbn')
+        fbx_file = shp_file.replace('.shp', '.fbx')
+        ain_file = shp_file.replace('.shp', '.ain')
+        aih_file = shp_file.replace('.shp', '.aih')
+        ixs_file = shp_file.replace('.shp', '.ixs')
+        mxs_file = shp_file.replace('.shp', '.mxs')
+        atx_file = shp_file.replace('.shp', '.atx')
+        xml_file = shp_file + '.xml'
+        cpg_file = shp_file.replace('.shp', '.cpg')
+        qix_file = shp_file.replace('.shp', '.qix')
+
+        sleep_cnt = 0
+        dbf_uploaded = False
+        while not dbf_uploaded:
+            if storage.Blob(bucket=bucket, name=dbf_file).exists(client):
+                dbf_uploaded = True
+            else:
+                sleep_cnt = sleep_cnt + 1
+                if sleep_cnt >= Default.SLEEP_COUNT:
+                    # Maximum sleeps reached, break out of loop
+                    break
+
+                time.sleep(Default.SLEEP_LENGTH)
+
+        sleep_cnt = 0
+        pos_index_uploaded = False
+        while not pos_index_uploaded:
+            if storage.Blob(bucket=bucket, name=pos_index_file).exists(client):
+                pos_index_uploaded = True
+            else:
+                sleep_cnt = sleep_cnt + 1
+                if sleep_cnt >= Default.SLEEP_COUNT:
+                    # Maximum sleeps reached, break out of loop
+                    break
+
+                time.sleep(Default.SLEEP_LENGTH)
+
+        sleep_cnt = 0
+        prj_uploaded = False
+        while not prj_uploaded:
+            if storage.Blob(bucket=bucket, name=prj_file).exists(client):
+                prj_uploaded = True
+            else:
+                sleep_cnt = sleep_cnt + 1
+                if sleep_cnt >= Default.SLEEP_COUNT:
+                    # Maximum sleeps reached, break out of loop
+                    break
+
+                time.sleep(Default.SLEEP_LENGTH)
+
+        if dbf_uploaded and pos_index_uploaded and prj_uploaded:
+            now = datetime.now()
+            print('[' + str(now) + '] ' + 'All required files received, continue.')
+            Utilities.shp_to_geojson(shp_file)
+        else:
+            now = datetime.now()
+            print('[' + str(now) + '] ' + "\t\tShapefile file missing.")
 
 
 if __name__ == '__main__':
